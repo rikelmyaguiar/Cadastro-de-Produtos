@@ -1,0 +1,141 @@
+services:
+
+  # ─── PostgreSQL ───────────────────────────────────────────
+  db:
+    image: supabase/postgres:15.1.0.117
+    container_name: supabase-db
+    restart: unless-stopped
+    ports:
+      - '5432:5432'
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./volumes/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── PostgREST (API REST automática sobre o Postgres) ─────
+  rest:
+    image: postgrest/postgrest:v12.0.2
+    container_name: supabase-rest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@db:5432/postgres
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: 'false'
+    ports:
+      - '3001:3000'
+
+  # ─── GoTrue (Autenticação) ─────────────────────────────────
+  auth:
+    image: supabase/gotrue:v2.143.0
+    container_name: supabase-auth
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: http://localhost:8000
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+      GOTRUE_SITE_URL: http://localhost:3000
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_DISABLE_SIGNUP: 'false'
+      GOTRUE_MAILER_AUTOCONFIRM: 'true'  # em dev, confirma e-mail automaticamente
+    ports:
+      - '9999:9999'
+
+  # ─── Kong (API Gateway — ponto de entrada do Supabase) ────
+  kong:
+    image: kong:2.8.1
+    container_name: supabase-kong
+    restart: unless-stopped
+    depends_on:
+      - rest
+      - auth
+    environment:
+      KONG_DATABASE: 'off'
+      KONG_DECLARATIVE_CONFIG: /var/lib/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+    volumes:
+      - ./volumes/kong/kong.yml:/var/lib/kong/kong.yml:ro
+    ports:
+      - '8000:8000'   # HTTP  → seu SUPABASE_URL local
+      - '8443:8443'   # HTTPS (opcional em dev)
+
+  # ─── Supabase Studio (dashboard visual) ───────────────────
+  studio:
+    image: supabase/studio:latest
+    container_name: supabase-studio
+    restart: unless-stopped
+    depends_on:
+      - kong
+    environment:
+      STUDIO_PG_META_URL: http://meta:8080
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DEFAULT_ORGANIZATION_NAME: Local Dev
+      DEFAULT_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-meu-projeto}
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_PUBLIC_URL: http://localhost:8000
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+    ports:
+      - '3003:3000'
+
+  # ─── pg-meta (usado pelo Studio para navegar no banco) ────
+  meta:
+    image: supabase/postgres-meta:v0.80.0
+    container_name: supabase-meta
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PG_META_PORT: 8080
+      PG_META_DB_HOST: db
+      PG_META_DB_PORT: 5432
+      PG_META_DB_NAME: postgres
+      PG_META_DB_USER: postgres
+      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - '8080:8080'
+
+  # ─── Next.js (Frontend) ───────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nextjs-app
+    restart: unless-stopped
+    depends_on:
+      - kong
+    environment:
+      # Aponta para o Kong local em vez do supabase.co
+      NEXT_PUBLIC_SUPABASE_URL: http://localhost:8000
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${ANON_KEY}
+    volumes:
+      - .:/app
+      - /app/node_modules
+      - /app/.next
+    ports:
+      - '3000:3000'
+    command: npm run dev
+
+volumes:
+  db-data:
